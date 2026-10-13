@@ -1,0 +1,1001 @@
+import { createServer } from 'node:http';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { extname, join, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+
+const root = fileURLToPath(new URL('.', import.meta.url));
+const db = new DatabaseSync(join(root, 'fastrack.sqlite'));
+db.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA foreign_keys = ON;
+  CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    sku TEXT NOT NULL UNIQUE,
+    category TEXT NOT NULL,
+    type TEXT NOT NULL,
+    color TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    price REAL NOT NULL CHECK(price >= 0),
+    wholesalePrice REAL CHECK(wholesalePrice IS NULL OR wholesalePrice >= 0),
+    costPrice REAL CHECK(costPrice IS NULL OR costPrice >= 0),
+    stock REAL NOT NULL DEFAULT 0 CHECK(stock >= 0),
+    lowStock REAL NOT NULL DEFAULT 5 CHECK(lowStock >= 0),
+    img TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS stock_movements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    productId INTEGER NOT NULL REFERENCES products(id),
+    quantity REAL NOT NULL,
+    beforeStock REAL NOT NULL,
+    afterStock REAL NOT NULL,
+    reason TEXT NOT NULL,
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS admin_auth (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    salt TEXT NOT NULL,
+    passwordHash TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS admin_sessions (
+    tokenHash TEXT PRIMARY KEY,
+    expiresAt INTEGER NOT NULL,
+    updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS customers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fullName TEXT NOT NULL,
+    email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    phone TEXT NOT NULL DEFAULT '',
+    passwordSalt TEXT NOT NULL,
+    passwordHash TEXT NOT NULL,
+    emailVerifiedAt TEXT,
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS customer_sessions (
+    tokenHash TEXT PRIMARY KEY,
+    customerId INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    expiresAt INTEGER NOT NULL,
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS customer_action_tokens (
+    tokenHash TEXT PRIMARY KEY,
+    customerId INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    action TEXT NOT NULL CHECK(action IN ('verify_email','reset_password')),
+    expiresAt INTEGER NOT NULL,
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS customer_wishlist (
+    customerId INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    productId INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(customerId, productId)
+  );
+  CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    orderNumber TEXT NOT NULL UNIQUE,
+    fullName TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    deliveryMethod TEXT NOT NULL CHECK(deliveryMethod IN ('delivery','pickup')),
+    state TEXT NOT NULL DEFAULT '',
+    city TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    instructions TEXT NOT NULL DEFAULT '',
+    subtotal REAL NOT NULL CHECK(subtotal >= 0),
+    deliveryFee REAL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    paymentStatus TEXT NOT NULL DEFAULT 'not_configured',
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    orderId INTEGER NOT NULL REFERENCES orders(id),
+    productId INTEGER NOT NULL REFERENCES products(id),
+    productName TEXT NOT NULL,
+    sku TEXT NOT NULL,
+    color TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    reserved INTEGER NOT NULL DEFAULT 0 CHECK(reserved IN (0,1)),
+    unitPrice REAL NOT NULL CHECK(unitPrice >= 0),
+    lineTotal REAL NOT NULL CHECK(lineTotal >= 0)
+  );
+  CREATE TABLE IF NOT EXISTS site_settings (
+    settingKey TEXT PRIMARY KEY,
+    settingValue TEXT NOT NULL,
+    updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS wholesale_applications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fullName TEXT NOT NULL,
+    businessName TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    email TEXT NOT NULL,
+    businessType TEXT NOT NULL,
+    businessAddress TEXT NOT NULL,
+    state TEXT NOT NULL,
+    monthlyPurchase TEXT NOT NULL DEFAULT '',
+    onlinePresence TEXT NOT NULL DEFAULT '',
+    additionalInfo TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','contacted','approved','rejected')),
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS sample_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fullName TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    productId INTEGER NOT NULL REFERENCES products(id),
+    productName TEXT NOT NULL,
+    sku TEXT NOT NULL,
+    preferredColour TEXT NOT NULL DEFAULT '',
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    deliveryLocation TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','contacted','processing','sent','completed','cancelled')),
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS quote_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    quoteNumber TEXT NOT NULL UNIQUE,
+    fullName TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    productId INTEGER NOT NULL REFERENCES products(id),
+    productName TEXT NOT NULL,
+    sku TEXT NOT NULL,
+    desiredColour TEXT NOT NULL DEFAULT '',
+    quantity REAL NOT NULL CHECK(quantity > 0),
+    deliveryLocation TEXT NOT NULL,
+    deadline TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    quotedAmount REAL CHECK(quotedAmount IS NULL OR quotedAmount >= 0),
+    response TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','sent','accepted','rejected','expired','converted')),
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS order_status_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    orderId INTEGER NOT NULL REFERENCES orders(id),
+    status TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS payment_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    orderId INTEGER NOT NULL UNIQUE REFERENCES orders(id),
+    provider TEXT NOT NULL CHECK(provider='paystack'),
+    reference TEXT NOT NULL UNIQUE,
+    amountKobo INTEGER NOT NULL CHECK(amountKobo > 0),
+    currency TEXT NOT NULL DEFAULT 'NGN',
+    status TEXT NOT NULL DEFAULT 'initialized' CHECK(status IN ('initialized','successful','failed','review')),
+    authorizationUrl TEXT NOT NULL DEFAULT '',
+    expiresAt INTEGER NOT NULL,
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS order_email_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    orderId INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    eventType TEXT NOT NULL CHECK(eventType IN ('request_received','payment_confirmed','payment_failed','payment_review')),
+    recipient TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    textBody TEXT NOT NULL,
+    htmlBody TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sending','sent','failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retryAt INTEGER NOT NULL DEFAULT 0,
+    createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    sentAt TEXT,
+    UNIQUE(orderId,eventType)
+  );
+  CREATE TABLE IF NOT EXISTS delivery_zones (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    state TEXT NOT NULL,
+    city TEXT NOT NULL DEFAULT '',
+    fee REAL NOT NULL CHECK(fee >= 0),
+    estimate TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    UNIQUE(state,city)
+  );
+`);
+if (!db.prepare('PRAGMA table_info(order_items)').all().some(column => column.name === 'reserved')) db.exec('ALTER TABLE order_items ADD COLUMN reserved INTEGER NOT NULL DEFAULT 0 CHECK(reserved IN (0,1))');
+if (!db.prepare('PRAGMA table_info(orders)').all().some(column => column.name === 'customerId')) db.exec('ALTER TABLE orders ADD COLUMN customerId INTEGER REFERENCES customers(id)');
+if (!db.prepare('PRAGMA table_info(customers)').all().some(column => column.name === 'emailVerifiedAt')) db.exec('ALTER TABLE customers ADD COLUMN emailVerifiedAt TEXT');
+db.exec('CREATE INDEX IF NOT EXISTS orders_customer_created ON orders(customerId, createdAt DESC)');
+db.prepare('DELETE FROM admin_sessions WHERE expiresAt < ?').run(Date.now());
+db.prepare('DELETE FROM customer_sessions WHERE expiresAt < ?').run(Date.now());
+db.prepare('DELETE FROM customer_action_tokens WHERE expiresAt < ?').run(Date.now());
+db.prepare("UPDATE order_email_outbox SET status='pending' WHERE status='sending'").run();
+
+const seed = JSON.parse(await readFile(join(root, 'catalog.json'), 'utf8'));
+if (db.prepare('SELECT COUNT(*) AS count FROM products').get().count === 0) {
+  const insert = db.prepare(`INSERT INTO products
+    (id,name,sku,category,type,color,unit,price,stock,lowStock,img,description)
+    VALUES (@id,@name,@sku,@category,@type,@color,@unit,@price,@stock,@lowStock,@img,@description)`);
+  db.exec('BEGIN IMMEDIATE');
+  try { for (const product of seed) insert.run(product); db.exec('COMMIT'); }
+  catch (error) { db.exec('ROLLBACK'); throw error; }
+}
+
+const loginAttempts = new Map();
+const customerLoginAttempts = new Map();
+const publicRequestAttempts = new Map();
+const mime = { '.html':'text/html; charset=utf-8', '.css':'text/css; charset=utf-8', '.js':'text/javascript; charset=utf-8', '.json':'application/json; charset=utf-8', '.svg':'image/svg+xml', '.jpg':'image/jpeg', '.png':'image/png', '.webp':'image/webp' };
+const productSelect = `SELECT p.id,p.name,p.sku,p.category,p.type,p.color,p.unit,p.price,p.wholesalePrice,p.costPrice,p.stock,p.lowStock,p.img,p.description,p.updatedAt,COALESCE(r.quantity,0) AS reservedStock,p.stock-COALESCE(r.quantity,0) AS availableStock FROM products p LEFT JOIN (SELECT oi.productId,SUM(oi.quantity) AS quantity FROM order_items oi JOIN orders o ON o.id=oi.orderId WHERE oi.reserved=1 AND o.status IN ('pending_payment','confirmed','processing','packed','dispatched') GROUP BY oi.productId) r ON r.productId=p.id`;
+const statements = {
+  all: db.prepare(`${productSelect} ORDER BY p.id`),
+  one: db.prepare(`${productSelect} WHERE p.id=?`),
+  insert: db.prepare(`INSERT INTO products (name,sku,category,type,color,unit,price,wholesalePrice,costPrice,stock,lowStock,img,description,updatedAt) VALUES (@name,@sku,@category,@type,@color,@unit,@price,@wholesalePrice,@costPrice,@stock,@lowStock,@img,@description,CURRENT_TIMESTAMP)`),
+  update: db.prepare(`UPDATE products SET name=@name,sku=@sku,category=@category,type=@type,color=@color,unit=@unit,price=@price,wholesalePrice=@wholesalePrice,costPrice=@costPrice,stock=@stock,lowStock=@lowStock,img=@img,description=@description,updatedAt=CURRENT_TIMESTAMP WHERE id=@id`),
+  movements: db.prepare(`SELECT m.id,m.productId,p.name,p.sku,m.quantity,m.beforeStock,m.afterStock,m.reason,m.createdAt FROM stock_movements m JOIN products p ON p.id=m.productId ORDER BY m.id DESC LIMIT 100`)
+};
+const textureCategories = new Set(['Atiku Fabrics','Guinea Brocade','Jacquard Voile','Bazin & Lace']);
+function getSiteContent() {
+  const content = { heroImage:'', editorialImage:'', textureImages:{} };
+  for (const row of db.prepare("SELECT settingKey,settingValue FROM site_settings WHERE settingKey LIKE 'home.%'").all()) {
+    if (row.settingKey === 'home.heroImage') content.heroImage = row.settingValue;
+    else if (row.settingKey === 'home.editorialImage') content.editorialImage = row.settingValue;
+    else if (row.settingKey.startsWith('home.texture.')) content.textureImages[row.settingKey.slice('home.texture.'.length)] = row.settingValue;
+  }
+  return content;
+}
+
+function send(res, status, data, extra = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...extra });
+  res.end(JSON.stringify(data));
+}
+function cookie(req, name) {
+  return (req.headers.cookie || '').split(';').map(part => part.trim()).find(part => part.startsWith(name + '='))?.slice(name.length + 1);
+}
+function authenticated(req) {
+  const key = cookie(req, 'ff_admin');
+  if(!key||!/^[a-f0-9]{64}$/.test(key))return false;
+  const tokenHash=createHash('sha256').update(key).digest('hex'),session=db.prepare('SELECT expiresAt FROM admin_sessions WHERE tokenHash=?').get(tokenHash);
+  if(!session||session.expiresAt<Date.now()){if(session)db.prepare('DELETE FROM admin_sessions WHERE tokenHash=?').run(tokenHash);return false;}
+  db.prepare('UPDATE admin_sessions SET expiresAt=?,updatedAt=CURRENT_TIMESTAMP WHERE tokenHash=?').run(Date.now()+8*60*60*1000,tokenHash);
+  return true;
+}
+async function body(req, maxBytes = 100_000) {
+  const chunks = []; let size = 0; for await (const chunk of req) { size += chunk.length; if (size > maxBytes) throw new Error('Request is too large.'); chunks.push(chunk); }
+  const text = Buffer.concat(chunks).toString('utf8');
+  try { return text ? JSON.parse(text) : {}; } catch { throw new Error('Request body must be valid JSON.'); }
+}
+function productInput(data) {
+  const required = ['name','sku','category','type','color','unit'];
+  for (const key of required) if (typeof data[key] !== 'string' || !data[key].trim() || data[key].length > 160) throw new Error(`Enter a valid ${key}.`);
+  for (const key of ['price','stock','lowStock']) if (!Number.isFinite(Number(data[key])) || Number(data[key]) < 0) throw new Error(`${key} must be zero or greater.`);
+  for (const key of ['wholesalePrice','costPrice']) if (data[key] !== '' && data[key] != null && (!Number.isFinite(Number(data[key])) || Number(data[key]) < 0)) throw new Error(`${key} must be zero or greater.`);
+  const img = String(data.img || '').trim();
+  if (img && !img.startsWith('photo-') && !(img.startsWith('https://') && img.length < 2048) && !/^\/uploads\/[a-f0-9]{32}\.(?:jpg|png|webp)$/.test(img)) throw new Error('Use an HTTPS image URL, upload an image, or leave the image field blank.');
+  return {
+    name:data.name.trim(), sku:data.sku.trim(), category:data.category.trim(), type:data.type.trim(), color:data.color.trim(), unit:data.unit.trim(),
+    price:Number(data.price), wholesalePrice:data.wholesalePrice === '' || data.wholesalePrice == null ? null : Number(data.wholesalePrice),
+    costPrice:data.costPrice === '' || data.costPrice == null ? null : Number(data.costPrice), stock:Number(data.stock), lowStock:Number(data.lowStock),
+    img, description:String(data.description || '').trim().slice(0,4000)
+  };
+}
+function establishSession(res) {
+  const key = randomBytes(32).toString('hex'),tokenHash=createHash('sha256').update(key).digest('hex');
+  db.prepare('INSERT INTO admin_sessions (tokenHash,expiresAt) VALUES (?,?)').run(tokenHash,Date.now()+8*60*60*1000);
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  return { 'Set-Cookie':`ff_admin=${key}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure}` };
+}
+function customerForRequest(req) {
+  const key = cookie(req,'ff_customer');
+  if (!key || !/^[a-f0-9]{64}$/.test(key)) return null;
+  const tokenHash = createHash('sha256').update(key).digest('hex');
+  const session = db.prepare('SELECT customerId,expiresAt FROM customer_sessions WHERE tokenHash=?').get(tokenHash);
+  if (!session || session.expiresAt < Date.now()) {
+    if (session) db.prepare('DELETE FROM customer_sessions WHERE tokenHash=?').run(tokenHash);
+    return null;
+  }
+  const customer = db.prepare('SELECT id,fullName,email,phone,emailVerifiedAt,createdAt FROM customers WHERE id=?').get(session.customerId);
+  if (!customer) { db.prepare('DELETE FROM customer_sessions WHERE tokenHash=?').run(tokenHash); return null; }
+  db.prepare('UPDATE customer_sessions SET expiresAt=? WHERE tokenHash=?').run(Date.now()+30*24*60*60*1000,tokenHash);
+  return customer;
+}
+function customerPayload(customerId) {
+  const customer = db.prepare('SELECT id,fullName,email,phone,emailVerifiedAt,createdAt FROM customers WHERE id=?').get(customerId);
+  if (!customer) return null;
+  const wishlist = db.prepare('SELECT productId FROM customer_wishlist WHERE customerId=? ORDER BY createdAt DESC').all(customerId).map(row=>row.productId);
+  return { customer, wishlist };
+}
+function customerEmailConfigured() {
+  const baseUrl = String(process.env.FASTRACK_PUBLIC_URL||'').trim();
+  return Boolean(process.env.RESEND_API_KEY && process.env.FASTRACK_EMAIL_FROM && (process.env.NODE_ENV!=='production' || /^https:\/\//i.test(baseUrl)));
+}
+function createCustomerActionToken(customerId, action, ttlMs) {
+  const token=randomBytes(32).toString('hex'),tokenHash=createHash('sha256').update(token).digest('hex');
+  db.prepare('DELETE FROM customer_action_tokens WHERE customerId=? AND action=?').run(customerId,action);
+  db.prepare('INSERT INTO customer_action_tokens (tokenHash,customerId,action,expiresAt) VALUES (?,?,?,?)').run(tokenHash,customerId,action,Date.now()+ttlMs);
+  return token;
+}
+function customerActionUrl(path, action, token) {
+  let base=String(process.env.FASTRACK_PUBLIC_URL||'').trim().replace(/\/+$/,'');
+  if(!base){if(process.env.NODE_ENV==='production')return null;base=`http://localhost:${Number(process.env.PORT||4173)}`;}
+  const url=new URL(path,base),key=action==='verify_email'?'verify':'reset';
+  url.hash=new URLSearchParams({[key]:token}).toString();
+  return url.toString();
+}
+function htmlText(value) { return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char])); }
+function queueOrderEmail(orderId,eventType) {
+  if(!customerEmailConfigured())return;
+  const order=db.prepare('SELECT orderNumber,fullName,email,deliveryMethod,state,city,subtotal,deliveryFee FROM orders WHERE id=?').get(orderId);
+  if(!order?.email)return;
+  const items=db.prepare('SELECT productName,color,unit,quantity,lineTotal FROM order_items WHERE orderId=? ORDER BY id').all(orderId);
+  const itemLines=items.map(item=>`- ${item.productName} (${item.color}), ${Number(item.quantity).toLocaleString()} ${item.unit}: ₦${Number(item.lineTotal).toLocaleString('en-NG')}`);
+  const titles={request_received:'We received your FASTRACK order request',payment_confirmed:'Your FASTRACK order is confirmed',payment_failed:'Payment was not completed for your FASTRACK order',payment_review:'Your FASTRACK payment needs review'};
+  const messages={request_received:'We received your order request. This request is unpaid and is not yet confirmed. Our team will contact you to confirm availability and delivery details.',payment_confirmed:'Your payment has been verified and your order is confirmed. Our team will prepare your fabrics for fulfilment.',payment_failed:'The payment was not completed, so your order has not been confirmed. You can return to the site and try again after checking your order status.',payment_review:'We received a payment that needs staff review before fulfilment. Please contact FASTRACK using the contact details on our website and include your order reference.'};
+  const base=String(process.env.FASTRACK_PUBLIC_URL||'').trim()||`http://localhost:${Number(process.env.PORT||4173)}`;
+  const trackingUrl=new URL('/track-order',base).toString(),delivery=order.deliveryMethod==='pickup'?'Store pickup':`${order.city}, ${order.state}`;
+  const total=order.deliveryFee===null?null:Number(order.subtotal)+Number(order.deliveryFee),totalLine=total===null?'Delivery fee: To be confirmed':`Estimated total: ₦${total.toLocaleString('en-NG')}`;
+  const subject=titles[eventType],text=`Hello ${order.fullName},\n\n${messages[eventType]}\n\nOrder reference: ${order.orderNumber}\nItems:\n${itemLines.join('\n')}\n\n${totalLine}\nDelivery: ${delivery}\n\nTrack your order: ${trackingUrl}\n\nFASTRACK FABRICS`;
+  const html=`<div style="max-width:620px;margin:0 auto;padding:36px 24px;font-family:Arial,sans-serif;color:#171613"><p style="font-size:12px;letter-spacing:3px">FASTRACK FABRICS</p><h1 style="font-family:Georgia,serif;font-weight:400">${htmlText(subject)}</h1><p>Hello ${htmlText(order.fullName)},</p><p>${htmlText(messages[eventType])}</p><p><strong>Order reference:</strong> ${htmlText(order.orderNumber)}</p><ul>${items.map(item=>`<li>${htmlText(item.productName)} (${htmlText(item.color)}) · ${Number(item.quantity).toLocaleString()} ${htmlText(item.unit)} · ₦${Number(item.lineTotal).toLocaleString('en-NG')}</li>`).join('')}</ul><p><strong>${htmlText(totalLine)}</strong><br>Delivery: ${htmlText(delivery)}</p><p style="margin:28px 0"><a href="${htmlText(trackingUrl)}" style="display:inline-block;padding:13px 18px;background:#171613;color:#fff;text-decoration:none">Track your order</a></p><p style="color:#69665f;font-size:13px">FASTRACK FABRICS</p></div>`;
+  db.prepare(`INSERT OR IGNORE INTO order_email_outbox (orderId,eventType,recipient,subject,textBody,htmlBody) VALUES (?,?,?,?,?,?)`).run(orderId,eventType,order.email,subject,text,html);
+}
+let emailOutboxBusy=false;
+async function dispatchOrderEmailOutbox() {
+  if(emailOutboxBusy||!customerEmailConfigured())return;
+  emailOutboxBusy=true;
+  try{
+    const pending=db.prepare("SELECT * FROM order_email_outbox WHERE status='pending' AND retryAt<=? ORDER BY id LIMIT 5").all(Date.now());
+    for(const email of pending){
+      const claimed=db.prepare("UPDATE order_email_outbox SET status='sending',attempts=attempts+1 WHERE id=? AND status='pending'").run(email.id);
+      if(!claimed.changes)continue;
+      const attempts=email.attempts+1;
+      try{
+        const response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{Authorization:`Bearer ${process.env.RESEND_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({from:process.env.FASTRACK_EMAIL_FROM,to:[email.recipient],subject:email.subject,text:email.textBody,html:email.htmlBody}),signal:AbortSignal.timeout(12000)});
+        if(!response.ok)throw new Error(`HTTP ${response.status}`);
+        db.prepare("UPDATE order_email_outbox SET status='sent',sentAt=CURRENT_TIMESTAMP WHERE id=?").run(email.id);
+      }catch(error){
+        const terminal=attempts>=8,retryAt=Date.now()+Math.min(6*60*60*1000,30_000*2**Math.min(attempts-1,10));
+        db.prepare('UPDATE order_email_outbox SET status=?,retryAt=? WHERE id=?').run(terminal?'failed':'pending',retryAt,email.id);
+        console.error(`Order email delivery attempt ${attempts} ${terminal?'failed permanently':'will retry'}.`);
+      }
+    }
+  }catch(error){console.error('Order email queue could not be processed.',error?.message||'');}
+  finally{emailOutboxBusy=false;}
+}
+const orderEmailTimer=setInterval(dispatchOrderEmailOutbox,5000);orderEmailTimer.unref();
+async function sendCustomerActionEmail(customer, action, token) {
+  const verifying=action==='verify_email',link=customerActionUrl(verifying?'/account/verify':'/account/reset',action,token);
+  if(!link)throw new Error('Customer email links require FASTRACK_PUBLIC_URL.');
+  const subject=verifying?'Verify your FASTRACK FABRICS account':'Reset your FASTRACK FABRICS password';
+  const actionLabel=verifying?'Verify email address':'Choose a new password';
+  const text=`Hello ${customer.fullName},\n\n${verifying?'Verify your email address to keep your FASTRACK account details accurate.':'We received a request to reset your FASTRACK account password.'}\n\n${actionLabel}: ${link}\n\nThis link expires in ${verifying?'60 minutes':'30 minutes'}. If you did not request this, you can ignore this email.`;
+  const html=`<div style="max-width:600px;margin:0 auto;padding:36px 24px;font-family:Arial,sans-serif;color:#171613"><p style="font-size:12px;letter-spacing:3px">FASTRACK FABRICS</p><h1 style="font-family:Georgia,serif;font-weight:400">${actionLabel}</h1><p>Hello ${htmlText(customer.fullName)},</p><p>${verifying?'Verify your email address to keep your FASTRACK account details accurate.':'We received a request to reset your FASTRACK account password.'}</p><p style="margin:30px 0"><a href="${htmlText(link)}" style="display:inline-block;padding:14px 20px;background:#171613;color:#fff;text-decoration:none">${actionLabel}</a></p><p style="color:#69665f;font-size:13px">This link expires in ${verifying?'60 minutes':'30 minutes'}. If you did not request this, you can ignore this email.</p></div>`;
+  if(!process.env.RESEND_API_KEY||!process.env.FASTRACK_EMAIL_FROM)return {developmentActionUrl:process.env.NODE_ENV==='production'?undefined:link};
+  try {
+    const response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{'Authorization':`Bearer ${process.env.RESEND_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({from:process.env.FASTRACK_EMAIL_FROM,to:[customer.email],subject,text,html}),signal:AbortSignal.timeout(12000)});
+    if(!response.ok){console.error(`Transactional email provider returned HTTP ${response.status}.`);throw new Error('Email delivery failed.');}
+  } catch(error) { if(error?.name==='TimeoutError')console.error('Transactional email provider timed out.');throw new Error('Email delivery failed.'); }
+  return {};
+}
+function establishCustomerSession(res, customerId) {
+  const key = randomBytes(32).toString('hex'),tokenHash = createHash('sha256').update(key).digest('hex');
+  db.prepare('INSERT INTO customer_sessions (tokenHash,customerId,expiresAt) VALUES (?,?,?)').run(tokenHash,customerId,Date.now()+30*24*60*60*1000);
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  return { 'Set-Cookie':`ff_customer=${key}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${secure}` };
+}
+function sameOriginRequest(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try { return new URL(origin).host === req.headers.host; } catch { return false; }
+}
+function isLoopback(address) { return address === '127.0.0.1' || address === '::1' || address?.startsWith('::ffff:127.'); }
+function allowPublicRequest(req, kind) {
+  const now=Date.now(), key=`${kind}:${req.socket.remoteAddress||'unknown'}`;
+  let attempt=publicRequestAttempts.get(key);
+  if(!attempt||attempt.reset<now){attempt={count:0,reset:now+15*60*1000};publicRequestAttempts.set(key,attempt)}
+  if(attempt.count>=12)return false;
+  attempt.count++;
+  if(publicRequestAttempts.size>5000)for(const [entry,value] of publicRequestAttempts)if(value.reset<now)publicRequestAttempts.delete(entry);
+  return true;
+}
+function paystackSecret() {
+  const key=String(process.env.PAYSTACK_SECRET_KEY||'').trim();
+  if(process.env.NODE_ENV==='production')return /^sk_live_[A-Za-z0-9]+$/.test(key)?key:'';
+  return /^sk_(?:test|live)_[A-Za-z0-9]+$/.test(key)?key:'';
+}
+function paystackPublicUrl() {
+  const configured=String(process.env.FASTRACK_PUBLIC_URL||'').trim();
+  if(configured){try{const url=new URL(configured);if(process.env.NODE_ENV==='production'&&url.protocol!=='https:')return null;return url.origin}catch{return null}}
+  return process.env.NODE_ENV==='production'?null:`http://localhost:${Number(process.env.PORT||4173)}`;
+}
+async function rawBody(req,maxBytes=100_000) {
+  const chunks=[];let size=0;
+  for await(const chunk of req){size+=chunk.length;if(size>maxBytes)throw new Error('Request is too large.');chunks.push(chunk)}
+  return Buffer.concat(chunks);
+}
+async function verifyPaystackPayment(reference) {
+  const attempt=db.prepare(`SELECT p.*,o.orderNumber,o.status AS orderStatus FROM payment_attempts p JOIN orders o ON o.id=p.orderId WHERE p.reference=?`).get(reference);
+  if(!attempt)return {status:'unknown'};
+  if(attempt.status==='successful')return {status:attempt.orderStatus==='payment_review'?'review':'successful',orderNumber:attempt.orderNumber};
+  const secret=paystackSecret();if(!secret)throw new Error('Paystack is not configured.');
+  let response;
+  try{response=await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,{headers:{Authorization:`Bearer ${secret}`},signal:AbortSignal.timeout(12000)})}
+  catch(error){if(error?.name==='TimeoutError')throw new Error('Paystack verification timed out.');throw new Error('Paystack verification is unavailable.');}
+  if(!response.ok){console.error(`Paystack verification returned HTTP ${response.status}.`);throw new Error('Paystack verification is unavailable.');}
+  let payload;try{payload=await response.json()}catch{throw new Error('Paystack returned an invalid response.');}
+  const transaction=payload?.data;
+  if(!payload?.status||!transaction||transaction.reference!==reference)throw new Error('Paystack could not verify this transaction.');
+  const providerStatus=String(transaction.status||'').toLowerCase();
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    const fresh=db.prepare(`SELECT p.*,o.orderNumber,o.status AS orderStatus FROM payment_attempts p JOIN orders o ON o.id=p.orderId WHERE p.reference=?`).get(reference);
+    if(!fresh){db.exec('ROLLBACK');return {status:'unknown'};}
+    if(fresh.status==='successful'){db.exec('COMMIT');return {status:fresh.orderStatus==='payment_review'?'review':'successful',orderNumber:fresh.orderNumber};}
+    if(fresh.status==='review'){db.exec('COMMIT');return {status:'review',orderNumber:fresh.orderNumber};}
+    if(providerStatus==='success'){
+      const amountMatches=Number(transaction.amount)===fresh.amountKobo&&String(transaction.currency||'').toUpperCase()===fresh.currency;
+      if(!amountMatches){
+        db.prepare("UPDATE payment_attempts SET status='review',updatedAt=CURRENT_TIMESTAMP WHERE id=?").run(fresh.id);
+        db.prepare("UPDATE orders SET status='payment_review',paymentStatus='review' WHERE id=?").run(fresh.orderId);
+        db.prepare('UPDATE order_items SET reserved=0 WHERE orderId=?').run(fresh.orderId);
+        db.prepare("INSERT INTO order_status_history (orderId,status,note) VALUES (?,?,?)").run(fresh.orderId,'payment_review','Paystack reported a successful payment that needs amount or currency review.');
+        queueOrderEmail(fresh.orderId,'payment_review');
+        db.exec('COMMIT');return {status:'review',orderNumber:fresh.orderNumber};
+      }
+      db.prepare("UPDATE payment_attempts SET status='successful',updatedAt=CURRENT_TIMESTAMP WHERE id=?").run(fresh.id);
+      const late=fresh.orderStatus!=='pending_payment'||fresh.expiresAt<Date.now();
+      const nextStatus=late?'payment_review':'confirmed';
+      db.prepare("UPDATE orders SET status=?,paymentStatus='successful' WHERE id=?").run(nextStatus,fresh.orderId);
+      if(late)db.prepare('UPDATE order_items SET reserved=0 WHERE orderId=?').run(fresh.orderId);
+      db.prepare('INSERT INTO order_status_history (orderId,status,note) VALUES (?,?,?)').run(fresh.orderId,nextStatus,late?'Payment arrived after the order reservation expired or was cancelled. Staff review is required.':'Payment verified by Paystack; stock remains reserved for fulfilment.');
+      queueOrderEmail(fresh.orderId,late?'payment_review':'payment_confirmed');
+      db.exec('COMMIT');return {status:late?'review':'successful',orderNumber:fresh.orderNumber};
+    }
+    if(['failed','abandoned','reversed'].includes(providerStatus)){
+      db.prepare("UPDATE payment_attempts SET status='failed',updatedAt=CURRENT_TIMESTAMP WHERE id=?").run(fresh.id);
+      if(fresh.orderStatus==='pending_payment'){
+        db.prepare("UPDATE orders SET status='payment_failed',paymentStatus='failed' WHERE id=?").run(fresh.orderId);
+        db.prepare('UPDATE order_items SET reserved=0 WHERE orderId=?').run(fresh.orderId);
+        db.prepare("INSERT INTO order_status_history (orderId,status,note) VALUES (?,?,?)").run(fresh.orderId,'payment_failed','Paystack did not complete the payment; reserved stock was released.');
+        queueOrderEmail(fresh.orderId,'payment_failed');
+      }
+      db.exec('COMMIT');return {status:'failed',orderNumber:fresh.orderNumber};
+    }
+    db.exec('COMMIT');return {status:'pending',orderNumber:fresh.orderNumber};
+  }catch(error){try{db.exec('ROLLBACK')}catch{}throw error;}
+}
+function expirePaymentReservations() {
+  const expired=db.prepare(`SELECT p.id AS paymentId,o.id AS orderId,o.orderNumber,o.status AS orderStatus FROM payment_attempts p JOIN orders o ON o.id=p.orderId WHERE p.status='initialized' AND p.expiresAt<? AND o.status IN ('pending_payment','cancelled')`).all(Date.now());
+  if(!expired.length)return;
+  db.exec('BEGIN IMMEDIATE');
+  try{for(const row of expired){db.prepare("UPDATE payment_attempts SET status='failed',updatedAt=CURRENT_TIMESTAMP WHERE id=? AND status='initialized'").run(row.paymentId);if(row.orderStatus==='pending_payment'){db.prepare("UPDATE orders SET status='payment_failed',paymentStatus='failed' WHERE id=? AND status='pending_payment'").run(row.orderId);db.prepare('UPDATE order_items SET reserved=0 WHERE orderId=?').run(row.orderId);db.prepare("INSERT INTO order_status_history (orderId,status,note) VALUES (?,?,?)").run(row.orderId,'payment_failed','Payment session expired; reserved stock was released.');queueOrderEmail(row.orderId,'payment_failed');}}db.exec('COMMIT');}
+  catch(error){db.exec('ROLLBACK');console.error('Could not expire payment reservations.',error?.message||'');}
+}
+expirePaymentReservations();
+const paymentExpiryTimer=setInterval(expirePaymentReservations,60_000);paymentExpiryTimer.unref();
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  try {
+    if(url.pathname==='/api/health'&&req.method==='GET')return send(res,200,{status:'ok'});
+    if(url.pathname==='/api/webhooks/paystack'&&req.method==='POST'){
+      const secret=paystackSecret();if(!secret)return send(res,503,{error:'Paystack webhooks are not configured.'});
+      const raw=await rawBody(req),signature=String(req.headers['x-paystack-signature']||'');
+      if(!/^[a-f0-9]{128}$/i.test(signature))return send(res,401,{error:'Invalid webhook signature.'});
+      const expected=createHmac('sha512',secret).update(raw).digest(),provided=Buffer.from(signature,'hex');
+      if(expected.length!==provided.length||!timingSafeEqual(expected,provided))return send(res,401,{error:'Invalid webhook signature.'});
+      let event;try{event=JSON.parse(raw.toString('utf8'))}catch{return send(res,400,{error:'Webhook body must be valid JSON.'});}
+      if(event?.event==='charge.success'&&typeof event?.data?.reference==='string'){
+        try{await verifyPaystackPayment(event.data.reference)}catch(error){console.error(error.message||'Paystack webhook verification failed.');return send(res,503,{error:'Payment verification is temporarily unavailable.'});}
+      }
+      return send(res,200,{received:true});
+    }
+    if (url.pathname.startsWith('/api/')) {
+      if (req.method === 'GET' && url.pathname === '/api/products') return send(res, 200, statements.all.all());
+      if (req.method === 'GET' && url.pathname === '/api/payment/config') return send(res,200,{enabled:Boolean(paystackSecret()),provider:'paystack'});
+      if (url.pathname==='/api/payments/paystack/verify'&&req.method==='POST'){
+        if(!sameOriginRequest(req))return send(res,403,{error:'This request could not be verified. Refresh the page and try again.'});
+        if(!allowPublicRequest(req,'payment-verify'))return send(res,429,{error:'Please wait before checking this payment again.'});
+        const data=await body(req),reference=String(data.reference||'');
+        if(!/^[a-f0-9]{40}$/i.test(reference))return send(res,400,{error:'Enter a valid payment reference.'});
+        try{const result=await verifyPaystackPayment(reference);if(result.status==='unknown')return send(res,404,{error:'Payment reference not found.'});return send(res,200,result)}
+        catch(error){console.error(error.message||'Paystack verification failed.');return send(res,503,{error:'Payment status could not be checked right now. Please try again shortly.'});}
+      }
+      if (req.method === 'GET' && url.pathname === '/api/site-content') return send(res,200,getSiteContent());
+      if (url.pathname === '/api/customer/session' && req.method === 'GET') {
+        const customer = customerForRequest(req);
+        return send(res,200,customer?{authenticated:true,...customerPayload(customer.id)}:{authenticated:false});
+      }
+      if (url.pathname === '/api/customer/register' && req.method === 'POST') {
+        if (!sameOriginRequest(req)) return send(res,403,{error:'This request could not be verified. Refresh the page and try again.'});
+        if (!allowPublicRequest(req,'customer-register')) return send(res,429,{error:'Too many account requests from this connection. Please wait and try again.'});
+        if (process.env.NODE_ENV==='production'&&!customerEmailConfigured()) return send(res,503,{error:'Account email is not configured yet. Please contact FASTRACK for help.'});
+        const data = await body(req),fullName = String(data.fullName||'').trim(),email = String(data.email||'').trim().toLowerCase(),phone = String(data.phone||'').trim(),password = String(data.password||'');
+        if (fullName.length<2||fullName.length>160) return send(res,400,{error:'Enter your full name.'});
+        if (email.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return send(res,400,{error:'Enter a valid email address.'});
+        if (phone&&!/^\+?[0-9][0-9\s()\-]{8,18}$/.test(phone)) return send(res,400,{error:'Enter a valid phone number, or leave it blank.'});
+        if (password.length<12||password.length>1024) return send(res,400,{error:'Choose a password between 12 and 1,024 characters.'});
+        const salt = randomBytes(16).toString('hex'),passwordHash = scryptSync(password,salt,64).toString('hex');
+        let customerId;
+        try { customerId = Number(db.prepare('INSERT INTO customers (fullName,email,phone,passwordSalt,passwordHash) VALUES (?,?,?,?,?)').run(fullName,email,phone,salt,passwordHash).lastInsertRowid); }
+        catch { return send(res,409,{error:'An account with this email already exists. Sign in instead.'}); }
+        const customer=db.prepare('SELECT id,fullName,email FROM customers WHERE id=?').get(customerId),token=createCustomerActionToken(customerId,'verify_email',60*60*1000);
+        let emailResult;
+        try { emailResult=await sendCustomerActionEmail(customer,'verify_email',token); }
+        catch { db.prepare('DELETE FROM customer_action_tokens WHERE customerId=? AND action=?').run(customerId,'verify_email');db.prepare('DELETE FROM customers WHERE id=?').run(customerId);return send(res,503,{error:'We could not send the verification email. Please try again shortly.'}); }
+        return send(res,201,{...customerPayload(customerId),verificationEmailSent:!emailResult.developmentActionUrl,...emailResult},establishCustomerSession(res,customerId));
+      }
+      if (url.pathname === '/api/customer/login' && req.method === 'POST') {
+        if (!sameOriginRequest(req)) return send(res,403,{error:'This request could not be verified. Refresh the page and try again.'});
+        const ip = req.socket.remoteAddress||'unknown',now = Date.now();
+        let attempt = customerLoginAttempts.get(ip)||{count:0,reset:now+15*60*1000};
+        if (attempt.reset<now) attempt={count:0,reset:now+15*60*1000};
+        if (attempt.count>=8) return send(res,429,{error:'Too many sign-in attempts. Wait 15 minutes and try again.'});
+        const data = await body(req),email = String(data.email||'').trim().toLowerCase(),password = String(data.password||'');
+        if (email.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||!password||password.length>1024) return send(res,400,{error:'Enter a valid email and password.'});
+        const account = db.prepare('SELECT id,passwordSalt,passwordHash FROM customers WHERE email=? COLLATE NOCASE').get(email);
+        const suppliedHash = scryptSync(password,account?.passwordSalt||'fastrack-customer-dummy-salt',64);
+        const expectedHash = account?Buffer.from(account.passwordHash,'hex'):scryptSync('not-a-customer-password','fastrack-customer-dummy-salt',64);
+        const match = Boolean(account&&suppliedHash.length===expectedHash.length&&timingSafeEqual(suppliedHash,expectedHash));
+        if (!match) { attempt.count++;customerLoginAttempts.set(ip,attempt);return send(res,401,{error:'Email or password was incorrect.'}); }
+        customerLoginAttempts.delete(ip);
+        return send(res,200,customerPayload(account.id),establishCustomerSession(res,account.id));
+      }
+      if (url.pathname === '/api/customer/logout' && req.method === 'POST') {
+        if (!sameOriginRequest(req)) return send(res,403,{error:'This request could not be verified. Refresh the page and try again.'});
+        const key = cookie(req,'ff_customer');
+        if (key&&/^[a-f0-9]{64}$/.test(key)) db.prepare('DELETE FROM customer_sessions WHERE tokenHash=?').run(createHash('sha256').update(key).digest('hex'));
+        return send(res,200,{ok:true},{'Set-Cookie':'ff_customer=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'});
+      }
+      if (url.pathname === '/api/customer/send-verification' && req.method === 'POST') {
+        if (!sameOriginRequest(req)) return send(res,403,{error:'This request could not be verified. Refresh the page and try again.'});
+        if (!allowPublicRequest(req,'customer-verification')) return send(res,429,{error:'Please wait before requesting another verification email.'});
+        const customer=customerForRequest(req);if(!customer)return send(res,401,{error:'Sign in to verify your email address.'});
+        if(customer.emailVerifiedAt)return send(res,200,{alreadyVerified:true});
+        if(process.env.NODE_ENV==='production'&&!customerEmailConfigured())return send(res,503,{error:'Account email is not configured yet. Please contact FASTRACK for help.'});
+        const token=createCustomerActionToken(customer.id,'verify_email',60*60*1000);
+        try { const result=await sendCustomerActionEmail(customer,'verify_email',token);return send(res,200,{verificationEmailSent:!result.developmentActionUrl,...result}); }
+        catch { db.prepare('DELETE FROM customer_action_tokens WHERE customerId=? AND action=?').run(customer.id,'verify_email');return send(res,503,{error:'We could not send the verification email. Please try again shortly.'}); }
+      }
+      if (url.pathname === '/api/customer/verify-email' && req.method === 'POST') {
+        if (!sameOriginRequest(req)) return send(res,403,{error:'This request could not be verified. Refresh the page and try again.'});
+        const data=await body(req),token=String(data.token||'').toLowerCase();
+        if(!/^[a-f0-9]{64}$/.test(token))return send(res,400,{error:'This verification link is invalid or expired. Request another email and try again.'});
+        const tokenHash=createHash('sha256').update(token).digest('hex'),record=db.prepare("SELECT customerId,expiresAt FROM customer_action_tokens WHERE tokenHash=? AND action='verify_email'").get(tokenHash);
+        if(!record||record.expiresAt<Date.now())return send(res,400,{error:'This verification link is invalid or expired. Request another email and try again.'});
+        db.exec('BEGIN IMMEDIATE');
+        try { db.prepare('UPDATE customers SET emailVerifiedAt=COALESCE(emailVerifiedAt,CURRENT_TIMESTAMP),updatedAt=CURRENT_TIMESTAMP WHERE id=?').run(record.customerId);db.prepare('DELETE FROM customer_action_tokens WHERE customerId=? AND action=?').run(record.customerId,'verify_email');db.exec('COMMIT'); }
+        catch(error) { db.exec('ROLLBACK');throw error; }
+        return send(res,200,{verified:true});
+      }
+      if (url.pathname === '/api/customer/forgot-password' && req.method === 'POST') {
+        if (!sameOriginRequest(req)) return send(res,403,{error:'This request could not be verified. Refresh the page and try again.'});
+        if (!allowPublicRequest(req,'customer-password-reset')) return send(res,429,{error:'Please wait before requesting another password reset.'});
+        const data=await body(req),email=String(data.email||'').trim().toLowerCase();
+        if(email.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return send(res,400,{error:'Enter a valid email address.'});
+        const customer=db.prepare('SELECT id,fullName,email FROM customers WHERE email=? COLLATE NOCASE').get(email);
+        if(!customer)return send(res,200,{ok:true});
+        if(process.env.NODE_ENV==='production'&&!customerEmailConfigured()){console.error('Password reset email skipped because transactional email is not configured.');return send(res,200,{ok:true});}
+        const token=createCustomerActionToken(customer.id,'reset_password',30*60*1000);
+        try { const result=await sendCustomerActionEmail(customer,'reset_password',token);return send(res,200,{ok:true,...result}); }
+        catch { db.prepare('DELETE FROM customer_action_tokens WHERE customerId=? AND action=?').run(customer.id,'reset_password');console.error('Password reset email delivery failed.');return send(res,200,{ok:true}); }
+      }
+      if (url.pathname === '/api/customer/reset-password' && req.method === 'POST') {
+        if (!sameOriginRequest(req)) return send(res,403,{error:'This request could not be verified. Refresh the page and try again.'});
+        const data=await body(req),token=String(data.token||'').toLowerCase(),password=String(data.password||'');
+        if(!/^[a-f0-9]{64}$/.test(token)||password.length<12||password.length>1024)return send(res,400,{error:'Use a valid reset link and choose a password of at least 12 characters.'});
+        const tokenHash=createHash('sha256').update(token).digest('hex'),record=db.prepare("SELECT customerId,expiresAt FROM customer_action_tokens WHERE tokenHash=? AND action='reset_password'").get(tokenHash);
+        if(!record||record.expiresAt<Date.now())return send(res,400,{error:'This reset link is invalid or expired. Request another password reset.'});
+        const salt=randomBytes(16).toString('hex'),passwordHash=scryptSync(password,salt,64).toString('hex');
+        db.exec('BEGIN IMMEDIATE');
+        try { db.prepare('UPDATE customers SET passwordSalt=?,passwordHash=?,emailVerifiedAt=COALESCE(emailVerifiedAt,CURRENT_TIMESTAMP),updatedAt=CURRENT_TIMESTAMP WHERE id=?').run(salt,passwordHash,record.customerId);db.prepare('DELETE FROM customer_sessions WHERE customerId=?').run(record.customerId);db.prepare('DELETE FROM customer_action_tokens WHERE customerId=?').run(record.customerId);db.exec('COMMIT'); }
+        catch(error) { db.exec('ROLLBACK');throw error; }
+        return send(res,200,{ok:true},{'Set-Cookie':'ff_customer=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'});
+      }
+      if (url.pathname === '/api/customer/profile' && req.method === 'PATCH') {
+        if (!sameOriginRequest(req)) return send(res,403,{error:'This request could not be verified. Refresh the page and try again.'});
+        const customer = customerForRequest(req);if(!customer)return send(res,401,{error:'Sign in to update your profile.'});
+        const data = await body(req),fullName = String(data.fullName||'').trim(),phone = String(data.phone||'').trim();
+        if (fullName.length<2||fullName.length>160) return send(res,400,{error:'Enter your full name.'});
+        if (phone&&!/^\+?[0-9][0-9\s()\-]{8,18}$/.test(phone)) return send(res,400,{error:'Enter a valid phone number, or leave it blank.'});
+        db.prepare('UPDATE customers SET fullName=?,phone=?,updatedAt=CURRENT_TIMESTAMP WHERE id=?').run(fullName,phone,customer.id);
+        return send(res,200,customerPayload(customer.id));
+      }
+      if (url.pathname === '/api/customer/orders' && req.method === 'GET') {
+        const customer = customerForRequest(req);if(!customer)return send(res,401,{error:'Sign in to view your order history.'});
+        const orders = db.prepare('SELECT id,orderNumber,deliveryMethod,state,city,subtotal,deliveryFee,status,paymentStatus,createdAt FROM orders WHERE customerId=? ORDER BY id DESC LIMIT 200').all(customer.id);
+        const getItems = db.prepare('SELECT productName,sku,color,unit,quantity,unitPrice,lineTotal FROM order_items WHERE orderId=?');
+        return send(res,200,orders.map(order=>({...order,items:getItems.all(order.id)})));
+      }
+      if (url.pathname === '/api/customer/wishlist' && req.method === 'GET') {
+        const customer = customerForRequest(req);if(!customer)return send(res,401,{error:'Sign in to sync your saved fabrics.'});
+        return send(res,200,{productIds:customerPayload(customer.id).wishlist});
+      }
+      if (url.pathname === '/api/customer/wishlist' && req.method === 'PUT') {
+        if (!sameOriginRequest(req)) return send(res,403,{error:'This request could not be verified. Refresh the page and try again.'});
+        const customer = customerForRequest(req);if(!customer)return send(res,401,{error:'Sign in to sync your saved fabrics.'});
+        const data = await body(req);
+        if (!Array.isArray(data.productIds)||data.productIds.length>500||data.productIds.some(id=>!Number.isSafeInteger(Number(id))||Number(id)<1)) return send(res,400,{error:'The saved fabric list is invalid.'});
+        const productIds = [...new Set(data.productIds.map(Number))];
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          db.prepare('DELETE FROM customer_wishlist WHERE customerId=?').run(customer.id);
+          const saveProduct = db.prepare('INSERT OR IGNORE INTO customer_wishlist (customerId,productId) SELECT ?,id FROM products WHERE id=?');
+          for (const productId of productIds) saveProduct.run(customer.id,productId);
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK');throw error; }
+        return send(res,200,{productIds:customerPayload(customer.id).wishlist});
+      }
+      if (url.pathname === '/api/orders' && req.method === 'POST') {
+        if(!allowPublicRequest(req,'orders'))return send(res,429,{error:'Too many order requests from this connection. Please wait and try again.'});
+        const paymentEnabled=Boolean(paystackSecret()),publicBase=paystackPublicUrl();
+        if(process.env.NODE_ENV==='production'&&!paymentEnabled)return send(res,503,{error:'Online payments are not configured yet. Please contact FASTRACK to place your order.'});
+        if(paymentEnabled&&!publicBase)return send(res,503,{error:'Secure payment return URL is not configured.'});
+        if(process.env.NODE_ENV==='production'&&!customerEmailConfigured())return send(res,503,{error:'Order email delivery is not configured yet. Please contact FASTRACK to place your order.'});
+        const data = await body(req);
+        const sessionCustomer = customerForRequest(req),authenticatedCustomer = sessionCustomer?.emailVerifiedAt ? sessionCustomer : null;
+        const fullName = String(data.fullName || sessionCustomer?.fullName || '').trim(), phone = String(data.phone || sessionCustomer?.phone || '').trim(), email = String(data.email || sessionCustomer?.email || '').trim();
+        const deliveryMethod = data.deliveryMethod === 'pickup' ? 'pickup' : data.deliveryMethod === 'delivery' ? 'delivery' : '';
+        const state = String(data.state || '').trim(), city = String(data.city || '').trim(), address = String(data.address || '').trim(), instructions = String(data.instructions || '').trim().slice(0,1000);
+        if (fullName.length < 2 || fullName.length > 160) return send(res,400,{error:'Enter your full name.'});
+        if (!/^\+?[0-9][0-9\s()\-]{8,18}$/.test(phone)) return send(res,400,{error:'Enter a valid phone number.'});
+        if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return send(res,400,{error:'Enter a valid email address.'});
+        if (paymentEnabled && !email) return send(res,400,{error:'Enter an email address to continue to secure payment.'});
+        if (!deliveryMethod) return send(res,400,{error:'Choose delivery or pickup.'});
+        if (deliveryMethod === 'delivery' && (!state || state.length > 80 || !city || city.length > 120 || !address || address.length > 500)) return send(res,400,{error:'Enter a state, city and delivery address.'});
+        if (!Array.isArray(data.items) || data.items.length < 1 || data.items.length > 50) return send(res,400,{error:'Your bag is empty or contains too many lines.'});
+        const quantities = new Map();
+        for (const item of data.items) {
+          const id = Number(item.id), quantity = Number(item.quantity);
+          if (!Number.isSafeInteger(id) || !Number.isFinite(quantity) || quantity <= 0 || quantity > 100000) return send(res,400,{error:'A product quantity is invalid.'});
+          quantities.set(id,(quantities.get(id)||0)+quantity);
+        }
+        let paymentReference='',paymentAmountKobo=0,orderId=0,createdOrder=null;
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          let deliveryFee=deliveryMethod==='pickup'?0:null;
+          if(deliveryMethod==='delivery'){
+            const zones=db.prepare('SELECT COUNT(*) AS count FROM delivery_zones WHERE active=1').get().count;
+            const zone=db.prepare(`SELECT fee FROM delivery_zones WHERE active=1 AND lower(trim(state))=lower(trim(?)) AND (city='' OR lower(trim(city))=lower(trim(?))) ORDER BY CASE WHEN city='' THEN 1 ELSE 0 END LIMIT 1`).get(state,city);
+            if(zones&&!zone){db.exec('ROLLBACK');return send(res,400,{error:'Delivery is not configured for that state and city. Choose pickup or contact us to confirm delivery.'});}
+            if(zone)deliveryFee=zone.fee;
+          }
+          if(paymentEnabled&&deliveryFee===null){db.exec('ROLLBACK');return send(res,400,{error:'Delivery charges are not configured for this area yet. Choose pickup or contact FASTRACK before paying.'});}
+          const lines=[];
+          for (const [id,quantity] of quantities) {
+            const product=statements.one.get(id);
+            if (!product) { db.exec('ROLLBACK'); return send(res,409,{error:'A fabric in your bag is no longer available.'}); }
+            if (quantity > product.availableStock) { db.exec('ROLLBACK'); return send(res,409,{error:`Only ${product.availableStock} ${product.unit.replace(/^per /,'')} of ${product.name} is available after active order reservations.`}); }
+            const lineTotal=Math.round(product.price*quantity*100)/100;
+            lines.push({product,quantity,lineTotal});
+          }
+          const subtotal=Math.round(lines.reduce((total,line)=>total+line.lineTotal,0)*100)/100;
+          const total=Math.round((subtotal+Number(deliveryFee||0))*100)/100;
+          paymentAmountKobo=Math.round(total*100);
+          if(paymentEnabled&&(!Number.isSafeInteger(paymentAmountKobo)||paymentAmountKobo<=0)){db.exec('ROLLBACK');return send(res,400,{error:'This order total cannot be sent for payment. Please contact FASTRACK.'});}
+          let orderNumber;
+          for(let i=0;i<5;i++) { const candidate=`FF-${new Date().getFullYear()}-${randomBytes(3).toString('hex').toUpperCase()}`; if(!db.prepare('SELECT id FROM orders WHERE orderNumber=?').get(candidate)){orderNumber=candidate;break;} }
+          if(!orderNumber) throw new Error('Could not generate an order reference. Please retry.');
+          const status=paymentEnabled?'pending_payment':'pending',paymentStatus=paymentEnabled?'pending':'not_configured';
+          const result=db.prepare(`INSERT INTO orders (orderNumber,fullName,phone,email,deliveryMethod,state,city,address,instructions,subtotal,deliveryFee,customerId,status,paymentStatus) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(orderNumber,fullName,phone,email,deliveryMethod,deliveryMethod==='pickup'?'':state,deliveryMethod==='pickup'?'':city,deliveryMethod==='pickup'?'':address,instructions,subtotal,deliveryFee,authenticatedCustomer?.id||null,status,paymentStatus);
+          orderId=Number(result.lastInsertRowid);
+          const insertItem=db.prepare(`INSERT INTO order_items (orderId,productId,productName,sku,color,unit,quantity,reserved,unitPrice,lineTotal) VALUES (?,?,?,?,?,?,?,?,?,?)`);
+          for(const line of lines) insertItem.run(orderId,line.product.id,line.product.name,line.product.sku,line.product.color,line.product.unit,line.quantity,paymentEnabled?1:0,line.product.price,line.lineTotal);
+          db.prepare('INSERT INTO order_status_history (orderId,status,note) VALUES (?,?,?)').run(orderId,status,paymentEnabled?'Awaiting Paystack payment; stock reserved for 30 minutes.':'Order request received');
+          if(paymentEnabled){
+            paymentReference=randomBytes(20).toString('hex');
+            db.prepare(`INSERT INTO payment_attempts (orderId,provider,reference,amountKobo,currency,status,expiresAt) VALUES (?,'paystack',?,?,'NGN','initialized',?)`).run(orderId,paymentReference,paymentAmountKobo,Date.now()+30*60*1000);
+          }else queueOrderEmail(orderId,'request_received');
+          createdOrder={orderNumber,subtotal,deliveryFee,total,status};
+          db.exec('COMMIT');
+        } catch(error) { db.exec('ROLLBACK'); throw error; }
+        if(!paymentEnabled)return send(res,201,{orderNumber:createdOrder.orderNumber,subtotal:createdOrder.subtotal,deliveryFee:createdOrder.deliveryFee,status:'pending',paymentRequired:false});
+        const callback=new URL('/order-confirmation',publicBase);callback.searchParams.set('reference',paymentReference);
+        let initialized;
+        try{
+          const response=await fetch('https://api.paystack.co/transaction/initialize',{method:'POST',headers:{Authorization:`Bearer ${paystackSecret()}`,'Content-Type':'application/json'},body:JSON.stringify({email,amount:String(paymentAmountKobo),currency:'NGN',reference:paymentReference,callback_url:callback.toString(),metadata:{order_number:createdOrder.orderNumber}}),signal:AbortSignal.timeout(12000)});
+          if(!response.ok){console.error(`Paystack initialization returned HTTP ${response.status}.`);throw new Error('Paystack could not start this payment.');}
+          const payload=await response.json(),authorizationUrl=String(payload?.data?.authorization_url||'');
+          if(!payload?.status||!/^https:\/\/checkout\.paystack\.com\//i.test(authorizationUrl))throw new Error('Paystack returned an invalid checkout link.');
+          initialized={authorizationUrl};
+        }catch(error){
+          db.exec('BEGIN IMMEDIATE');
+          try{db.prepare("UPDATE payment_attempts SET status='failed',updatedAt=CURRENT_TIMESTAMP WHERE reference=?").run(paymentReference);db.prepare("UPDATE orders SET status='payment_failed',paymentStatus='failed' WHERE id=? AND status='pending_payment'").run(orderId);db.prepare('UPDATE order_items SET reserved=0 WHERE orderId=?').run(orderId);db.prepare("INSERT INTO order_status_history (orderId,status,note) VALUES (?,?,?)").run(orderId,'payment_failed','Payment could not be initialized; reserved stock was released.');queueOrderEmail(orderId,'payment_failed');db.exec('COMMIT');}
+          catch(cleanupError){db.exec('ROLLBACK');console.error('Paystack initialization cleanup failed.',cleanupError?.message||'');}
+          console.error(error.message||'Paystack initialization failed.');return send(res,502,{error:'Secure payment could not be started. Your order was not charged. Please try again.'});
+        }
+        db.prepare('UPDATE payment_attempts SET authorizationUrl=?,updatedAt=CURRENT_TIMESTAMP WHERE reference=?').run(initialized.authorizationUrl,paymentReference);
+        return send(res,201,{paymentRequired:true,authorizationUrl:initialized.authorizationUrl,orderNumber:createdOrder.orderNumber,total:createdOrder.total,expiresAt:Date.now()+30*60*1000});
+      }
+      if (url.pathname === '/api/requests/wholesale' && req.method === 'POST') {
+        if(!allowPublicRequest(req,'wholesale'))return send(res,429,{error:'Too many applications from this connection. Please try again later.'});
+        const data = await body(req);
+        const value = (key, limit) => String(data[key] || '').trim().slice(0, limit);
+        const fullName=value('fullName',160), businessName=value('businessName',180), phone=value('phone',30), email=value('email',254), businessType=value('businessType',100), businessAddress=value('businessAddress',500), state=value('state',80);
+        if (fullName.length<2 || !businessName || !businessType || !businessAddress || !state) return send(res,400,{error:'Complete the required name and business details.'});
+        if (!/^\+?[0-9][0-9\s()\-]{8,18}$/.test(phone)) return send(res,400,{error:'Enter a valid phone number.'});
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return send(res,400,{error:'Enter a valid email address.'});
+        const result=db.prepare(`INSERT INTO wholesale_applications (fullName,businessName,phone,email,businessType,businessAddress,state,monthlyPurchase,onlinePresence,additionalInfo) VALUES (?,?,?,?,?,?,?,?,?,?)`).run(fullName,businessName,phone,email,businessType,businessAddress,state,value('monthlyPurchase',120),value('onlinePresence',300),value('additionalInfo',2000));
+        return send(res,201,{id:Number(result.lastInsertRowid),status:'new'});
+      }
+      if (url.pathname === '/api/requests/sample' && req.method === 'POST') {
+        if(!allowPublicRequest(req,'sample'))return send(res,429,{error:'Too many sample requests from this connection. Please try again later.'});
+        const data=await body(req), productId=Number(data.productId), quantity=Number(data.quantity), product=Number.isSafeInteger(productId)?db.prepare('SELECT id,name,sku,color FROM products WHERE id=?').get(productId):null;
+        const fullName=String(data.fullName||'').trim(),phone=String(data.phone||'').trim(),email=String(data.email||'').trim(),deliveryLocation=String(data.deliveryLocation||'').trim(),preferredColour=String(data.preferredColour||product?.color||'').trim(),message=String(data.message||'').trim().slice(0,1500);
+        if(fullName.length<2||fullName.length>160)return send(res,400,{error:'Enter your full name.'});
+        if(!/^\+?[0-9][0-9\s()\-]{8,18}$/.test(phone))return send(res,400,{error:'Enter a valid phone number.'});
+        if(email&&(email.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)))return send(res,400,{error:'Enter a valid email address.'});
+        if(!product)return send(res,400,{error:'Choose a fabric from the catalog.'});
+        if(!Number.isFinite(quantity)||quantity<=0||quantity>1000)return send(res,400,{error:'Enter a valid sample quantity.'});
+        if(!deliveryLocation||deliveryLocation.length>300)return send(res,400,{error:'Enter a delivery location.'});
+        const result=db.prepare(`INSERT INTO sample_requests (fullName,phone,email,productId,productName,sku,preferredColour,quantity,deliveryLocation,message) VALUES (?,?,?,?,?,?,?,?,?,?)`).run(fullName,phone,email,product.id,product.name,product.sku,preferredColour.slice(0,100),quantity,deliveryLocation,message);
+        return send(res,201,{id:Number(result.lastInsertRowid),status:'new'});
+      }
+      if (url.pathname === '/api/requests/quote' && req.method === 'POST') {
+        if(!allowPublicRequest(req,'quote'))return send(res,429,{error:'Too many quote requests from this connection. Please try again later.'});
+        const data=await body(req), productId=Number(data.productId), quantity=Number(data.quantity), product=Number.isSafeInteger(productId)?db.prepare('SELECT id,name,sku,color FROM products WHERE id=?').get(productId):null;
+        const fullName=String(data.fullName||'').trim(),phone=String(data.phone||'').trim(),email=String(data.email||'').trim(),deliveryLocation=String(data.deliveryLocation||'').trim(),desiredColour=String(data.desiredColour||product?.color||'').trim(),deadline=String(data.deadline||'').trim().slice(0,40),message=String(data.message||'').trim().slice(0,1500);
+        if(fullName.length<2||fullName.length>160)return send(res,400,{error:'Enter your full name.'});
+        if(!/^\+?[0-9][0-9\s()\-]{8,18}$/.test(phone))return send(res,400,{error:'Enter a valid phone number.'});
+        if(email&&(email.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)))return send(res,400,{error:'Enter a valid email address.'});
+        if(!product)return send(res,400,{error:'Choose a fabric from the catalog.'});
+        if(!Number.isFinite(quantity)||quantity<=0||quantity>100000)return send(res,400,{error:'Enter a valid order quantity.'});
+        if(!deliveryLocation||deliveryLocation.length>300)return send(res,400,{error:'Enter a delivery location.'});
+        let quoteNumber='';
+        for(let i=0;i<5;i++){const candidate=`FFQ-${new Date().getFullYear()}-${randomBytes(3).toString('hex').toUpperCase()}`;if(!db.prepare('SELECT id FROM quote_requests WHERE quoteNumber=?').get(candidate)){quoteNumber=candidate;break}}
+        if(!quoteNumber)throw new Error('Could not generate a quote reference. Please retry.');
+        db.prepare(`INSERT INTO quote_requests (quoteNumber,fullName,phone,email,productId,productName,sku,desiredColour,quantity,deliveryLocation,deadline,message) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(quoteNumber,fullName,phone,email,product.id,product.name,product.sku,desiredColour.slice(0,100),quantity,deliveryLocation,deadline,message);
+        return send(res,201,{quoteNumber,status:'draft'});
+      }
+      if(url.pathname==='/api/orders/track'&&req.method==='GET'){
+        if(!allowPublicRequest(req,'track'))return send(res,429,{error:'Too many tracking attempts. Please wait and try again.'});
+        const reference=String(url.searchParams.get('reference')||'').trim().toUpperCase(),contact=String(url.searchParams.get('contact')||'').trim();
+        if(!/^FF-\d{4}-[A-F0-9]{6}$/.test(reference)||contact.length<5||contact.length>254)return send(res,400,{error:'Enter your order reference and the phone number or email used at checkout.'});
+        const order=db.prepare(`SELECT id,orderNumber,fullName,phone,email,deliveryMethod,state,city,subtotal,deliveryFee,status,paymentStatus,createdAt FROM orders WHERE orderNumber=? AND (phone=? OR lower(email)=lower(?))`).get(reference,contact,contact);
+        if(!order)return send(res,404,{error:'We could not find an order with those details. Check the reference and contact information.'});
+        const items=db.prepare('SELECT productName,sku,color,unit,quantity,unitPrice,lineTotal FROM order_items WHERE orderId=?').all(order.id);
+        let history=db.prepare('SELECT status,note,createdAt FROM order_status_history WHERE orderId=? ORDER BY id').all(order.id);
+        if(!history.length)history=[{status:order.status,note:'Current order status',createdAt:order.createdAt}];
+        return send(res,200,{orderNumber:order.orderNumber,fullName:order.fullName,deliveryMethod:order.deliveryMethod,state:order.state,city:order.city,subtotal:order.subtotal,deliveryFee:order.deliveryFee,status:order.status,paymentStatus:order.paymentStatus,createdAt:order.createdAt,items,history});
+      }
+      if(url.pathname==='/api/delivery-zones'&&req.method==='GET')return send(res,200,db.prepare('SELECT state,city,fee,estimate FROM delivery_zones WHERE active=1 ORDER BY state,city').all());
+      if (url.pathname === '/api/admin/session' && req.method === 'GET') {
+        const configured = Boolean(process.env.FASTRACK_ADMIN_PASSWORD || db.prepare('SELECT id FROM admin_auth WHERE id=1').get());
+        return send(res, 200, { configured, needsSetup:!configured, authenticated:authenticated(req) });
+      }
+      if (url.pathname === '/api/admin/setup' && req.method === 'POST') {
+        if (process.env.FASTRACK_ADMIN_PASSWORD || db.prepare('SELECT id FROM admin_auth WHERE id=1').get()) return send(res, 409, { error:'Admin access has already been configured.' });
+        if (process.env.NODE_ENV === 'production' || !isLoopback(req.socket.remoteAddress)) return send(res, 403, { error:'First-use password setup is available only from this computer. Configure FASTRACK_ADMIN_PASSWORD on the server instead.' });
+        const data = await body(req), password = String(data.password || ''), confirmation = String(data.confirmation || '');
+        if (password.length < 14 || password.length > 1024) return send(res, 400, { error:'Choose a password between 14 and 1,024 characters.' });
+        if (password !== confirmation) return send(res, 400, { error:'The password entries do not match.' });
+        const salt = randomBytes(16).toString('hex'), passwordHash = scryptSync(password,salt,64).toString('hex');
+        try { db.prepare('INSERT INTO admin_auth (id,salt,passwordHash) VALUES (1,?,?)').run(salt,passwordHash); }
+        catch { return send(res, 409, { error:'Admin access was configured in another session. Refresh and sign in.' }); }
+        return send(res, 201, { authenticated:true }, establishSession(res));
+      }
+      if (url.pathname === '/api/admin/login' && req.method === 'POST') {
+        const ip = req.socket.remoteAddress || 'unknown';
+        const attempt = loginAttempts.get(ip) || { count:0, reset:Date.now()+15*60*1000 };
+        if (attempt.reset < Date.now()) { attempt.count=0; attempt.reset=Date.now()+15*60*1000; }
+        if (attempt.count >= 8) return send(res, 429, { error:'Too many attempts. Wait 15 minutes and try again.' });
+        const data = await body(req), configured = process.env.FASTRACK_ADMIN_PASSWORD || '';
+        const supplied = Buffer.from(String(data.password || ''));
+        const expected = Buffer.from(configured);
+        const stored = !configured && db.prepare('SELECT salt,passwordHash FROM admin_auth WHERE id=1').get();
+        const match = configured ? supplied.length === expected.length && timingSafeEqual(supplied, expected) : Boolean(stored && supplied.length > 0 && timingSafeEqual(scryptSync(supplied,stored.salt,64),Buffer.from(stored.passwordHash,'hex')));
+        if (!match) { attempt.count++; loginAttempts.set(ip, attempt); return send(res, configured || stored ? 401 : 503, { error:configured || stored ? 'The password was not accepted.' : 'Set up admin access from this computer first.' }); }
+        loginAttempts.delete(ip);
+        return send(res, 200, { authenticated:true }, establishSession(res));
+      }
+      if (url.pathname === '/api/admin/logout' && req.method === 'POST') {
+        const key = cookie(req,'ff_admin'); if (key&&/^[a-f0-9]{64}$/.test(key)) db.prepare('DELETE FROM admin_sessions WHERE tokenHash=?').run(createHash('sha256').update(key).digest('hex'));
+        return send(res, 200, { ok:true }, { 'Set-Cookie':'ff_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' });
+      }
+      if (!authenticated(req)) return send(res, 401, { error:'Admin sign-in is required.' });
+      if (url.pathname === '/api/admin/site-content' && req.method === 'PATCH') {
+        const data = await body(req), updates = [];
+        const validImage = value => typeof value === 'string' && value.length <= 2048 && (value.startsWith('https://') || /^photo-[A-Za-z0-9-]+$/.test(value) || /^\/uploads\/[a-f0-9]{32}\.(?:jpg|png|webp)$/.test(value));
+        if (Object.hasOwn(data,'heroImage')) {
+          if (!validImage(data.heroImage)) return send(res,400,{error:'Choose a valid hero image.'});
+          updates.push(['home.heroImage',data.heroImage]);
+        }
+        if (Object.hasOwn(data,'editorialImage')) {
+          if (!validImage(data.editorialImage)) return send(res,400,{error:'Choose a valid editorial image.'});
+          updates.push(['home.editorialImage',data.editorialImage]);
+        }
+        if (Object.hasOwn(data,'textureImages')) {
+          if (!data.textureImages || typeof data.textureImages !== 'object' || Array.isArray(data.textureImages)) return send(res,400,{error:'Category images are invalid.'});
+          for (const [category,image] of Object.entries(data.textureImages)) {
+            if (!textureCategories.has(category) || !validImage(image)) return send(res,400,{error:'A category image is invalid.'});
+            updates.push([`home.texture.${category}`,image]);
+          }
+        }
+        if (!updates.length) return send(res,400,{error:'Select at least one homepage image.'});
+        const upsert = db.prepare('INSERT INTO site_settings (settingKey,settingValue,updatedAt) VALUES (?,?,CURRENT_TIMESTAMP) ON CONFLICT(settingKey) DO UPDATE SET settingValue=excluded.settingValue,updatedAt=CURRENT_TIMESTAMP');
+        db.exec('BEGIN IMMEDIATE');
+        try { for (const [key,value] of updates) upsert.run(key,value); db.exec('COMMIT'); }
+        catch (error) { db.exec('ROLLBACK'); throw error; }
+        return send(res,200,getSiteContent());
+      }
+      if(url.pathname==='/api/admin/delivery-zones'&&req.method==='GET')return send(res,200,db.prepare('SELECT id,state,city,fee,estimate,active FROM delivery_zones ORDER BY state,city').all());
+      if(url.pathname==='/api/admin/delivery-zones'&&req.method==='PUT'){
+        const data=await body(req),zones=data.zones;
+        if(!Array.isArray(zones)||zones.length>200)return send(res,400,{error:'Provide up to 200 delivery zones.'});
+        const normalized=[],keys=new Set();
+        for(const zone of zones){
+          const state=String(zone.state||'').trim().slice(0,80),city=String(zone.city||'').trim().slice(0,120),estimate=String(zone.estimate||'').trim().slice(0,120),fee=Number(zone.fee),active=zone.active===false||zone.active===0||zone.active==='0'?0:1,key=`${state.toLowerCase()}|${city.toLowerCase()}`;
+          if(!state||!Number.isFinite(fee)||fee<0||!estimate)return send(res,400,{error:'Each zone needs a state, valid delivery fee and estimated delivery time.'});
+          if(keys.has(key))return send(res,400,{error:'Delivery zones must have unique state and city combinations.'});
+          keys.add(key);normalized.push({state,city,fee,estimate,active});
+        }
+        const insert=db.prepare('INSERT INTO delivery_zones (state,city,fee,estimate,active) VALUES (@state,@city,@fee,@estimate,@active)');
+        db.exec('BEGIN IMMEDIATE');
+        try{db.exec('DELETE FROM delivery_zones');for(const zone of normalized)insert.run(zone);db.exec('COMMIT')}catch(error){db.exec('ROLLBACK');throw error}
+        return send(res,200,db.prepare('SELECT id,state,city,fee,estimate,active FROM delivery_zones ORDER BY state,city').all());
+      }
+      if (url.pathname === '/api/admin/uploads' && req.method === 'POST') {
+        const data = await body(req, 8_500_000), type = String(data.type || ''), encoded = String(data.data || '');
+        if (!['image/jpeg','image/png','image/webp'].includes(type)) return send(res,400,{error:'Upload a JPEG, PNG or WebP image.'});
+        if (!encoded || encoded.length > 8_400_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) return send(res,400,{error:'The image data is invalid or too large.'});
+        const image = Buffer.from(encoded,'base64');
+        if (image.length > 6 * 1024 * 1024 || image.toString('base64') !== encoded) return send(res,400,{error:'Choose an image up to 6 MB.'});
+        let ext = '';
+        if (image.length >= 3 && image[0] === 0xff && image[1] === 0xd8 && image[2] === 0xff) ext = type === 'image/jpeg' ? '.jpg' : '';
+        else if (image.length >= 8 && image.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) ext = type === 'image/png' ? '.png' : '';
+        else if (image.length >= 12 && image.toString('ascii',0,4) === 'RIFF' && image.toString('ascii',8,12) === 'WEBP') ext = type === 'image/webp' ? '.webp' : '';
+        if (!ext) return send(res,400,{error:'The image file does not match its JPEG, PNG or WebP format.'});
+        const filename = `${randomBytes(16).toString('hex')}${ext}`;
+        const uploadDir = join(root,'uploads');
+        await mkdir(uploadDir,{recursive:true});
+        await writeFile(join(uploadDir,filename),image,{flag:'wx'});
+        return send(res,201,{img:`/uploads/${filename}`});
+      }
+      if (url.pathname === '/api/admin/movements' && req.method === 'GET') return send(res, 200, statements.movements.all());
+      if (url.pathname === '/api/admin/orders' && req.method === 'GET') {
+        const orders=db.prepare('SELECT id,orderNumber,fullName,phone,email,deliveryMethod,state,city,address,instructions,subtotal,deliveryFee,status,paymentStatus,createdAt FROM orders ORDER BY id DESC LIMIT 250').all();
+        const items=db.prepare('SELECT productName,sku,color,unit,quantity,unitPrice,lineTotal FROM order_items WHERE orderId=?');
+        const payment=db.prepare('SELECT provider,reference,status,amountKobo,currency FROM payment_attempts WHERE orderId=?');
+        return send(res,200,orders.map(order=>({...order,items:items.all(order.id),payment:payment.get(order.id)||null})));
+      }
+      const requestRoute=url.pathname.match(/^\/api\/admin\/(wholesale|samples|quotes)$/);
+      if(requestRoute&&req.method==='GET'){
+        const type=requestRoute[1];
+        const queries={wholesale:'SELECT * FROM wholesale_applications ORDER BY id DESC LIMIT 250',samples:'SELECT * FROM sample_requests ORDER BY id DESC LIMIT 250',quotes:'SELECT * FROM quote_requests ORDER BY id DESC LIMIT 250'};
+        return send(res,200,db.prepare(queries[type]).all());
+      }
+      const requestUpdate=url.pathname.match(/^\/api\/admin\/(wholesale|samples|quotes)\/(\d+)$/);
+      if(requestUpdate&&req.method==='PATCH'){
+        const [,type,idText]=requestUpdate,data=await body(req),id=Number(idText),status=String(data.status||'');
+        const config={wholesale:{table:'wholesale_applications',statuses:['new','contacted','approved','rejected']},samples:{table:'sample_requests',statuses:['new','contacted','processing','sent','completed','cancelled']},quotes:{table:'quote_requests',statuses:['draft','sent','accepted','rejected','expired','converted']}}[type];
+        const row=db.prepare(`SELECT id FROM ${config.table} WHERE id=?`).get(id);if(!row)return send(res,404,{error:'Request not found.'});
+        if(!config.statuses.includes(status))return send(res,400,{error:'Choose a valid request status.'});
+        if(type==='quotes'){
+          const current=db.prepare('SELECT status FROM quote_requests WHERE id=?').get(id).status,quoted=data.quotedAmount===''||data.quotedAmount==null?null:Number(data.quotedAmount),response=String(data.response||'').trim().slice(0,2000);
+          if(quoted!==null&&(!Number.isFinite(quoted)||quoted<0))return send(res,400,{error:'Quotation amount must be zero or greater.'});
+          if(status==='sent'&&quoted===null)return send(res,400,{error:'Add a quotation amount before sending the quote.'});
+          const transitions={draft:['draft','sent','expired'],sent:['sent','accepted','rejected','expired','converted'],accepted:['accepted','converted'],rejected:['rejected'],expired:['expired'],converted:['converted']};
+          if(!transitions[current]?.includes(status))return send(res,409,{error:`Cannot move a quote from ${current} to ${status}.`});
+          db.prepare('UPDATE quote_requests SET quotedAmount=?,response=?,status=?,updatedAt=CURRENT_TIMESTAMP WHERE id=?').run(quoted,response,status,id);
+        }else db.prepare(`UPDATE ${config.table} SET status=? WHERE id=?`).run(status,id);
+        return send(res,200,{ok:true,status});
+      }
+      const orderStatus=url.pathname.match(/^\/api\/admin\/orders\/(\d+)$/);
+      if(orderStatus&&req.method==='PATCH') {
+        const data=await body(req), allowed=new Set(['pending','pending_payment','payment_failed','payment_review','confirmed','processing','packed','dispatched','delivered','cancelled']), status=String(data.status||'');
+        if(!allowed.has(status)) return send(res,400,{error:'Choose a valid order status.'});
+        const id=Number(orderStatus[1]), order=db.prepare('SELECT id,orderNumber,status FROM orders WHERE id=?').get(id);
+        if(!order) return send(res,404,{error:'Order not found.'});
+        if(status===order.status) return send(res,200,{ok:true,status});
+        const transitions={pending:['confirmed','cancelled'],pending_payment:['cancelled'],payment_failed:['cancelled'],payment_review:['confirmed','cancelled'],confirmed:['processing','cancelled'],processing:['packed','cancelled'],packed:['dispatched','cancelled'],dispatched:['delivered'],delivered:[],cancelled:[]};
+        if(!transitions[order.status]?.includes(status)) return send(res,409,{error:`Cannot move an order from ${order.status} to ${status}.`});
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          const items=db.prepare('SELECT id,productId,quantity,reserved FROM order_items WHERE orderId=?').all(id);
+          if(status==='confirmed') {
+            for(const item of items) {
+              const p=statements.one.get(item.productId);
+              if(item.quantity>p.availableStock) { db.exec('ROLLBACK'); return send(res,409,{error:`There is not enough available stock for product ${p.sku}.`}); }
+            }
+            db.prepare('UPDATE order_items SET reserved=1 WHERE orderId=?').run(id);
+          }
+          if(status==='cancelled') db.prepare('UPDATE order_items SET reserved=0 WHERE orderId=?').run(id);
+          if(status==='delivered') {
+            for(const item of items) {
+              const p=statements.one.get(item.productId);
+              if(!item.reserved || p.stock<item.quantity) throw new Error(`Unable to fulfill reserved stock for ${p.sku}.`);
+              const after=p.stock-item.quantity;
+              db.prepare('UPDATE products SET stock=?,updatedAt=CURRENT_TIMESTAMP WHERE id=?').run(after,p.id);
+              db.prepare('INSERT INTO stock_movements (productId,quantity,beforeStock,afterStock,reason) VALUES (?,?,?,?,?)').run(p.id,-item.quantity,p.stock,after,`Order ${order.orderNumber} delivered`);
+            }
+            db.prepare('UPDATE order_items SET reserved=0 WHERE orderId=?').run(id);
+          }
+          db.prepare('UPDATE orders SET status=? WHERE id=?').run(status,id);
+          const notes={confirmed:'Order confirmed and stock reserved',processing:'Order preparation started',packed:'Order packed',dispatched:'Order dispatched',delivered:'Order delivered',cancelled:'Order cancelled and reserved stock released'};
+          db.prepare('INSERT INTO order_status_history (orderId,status,note) VALUES (?,?,?)').run(id,status,notes[status]||`Order status changed to ${status}`);
+          db.exec('COMMIT');
+        } catch(error) { db.exec('ROLLBACK'); throw error; }
+        return send(res,200,{ok:true,status});
+      }
+      if (url.pathname === '/api/admin/products' && req.method === 'POST') {
+        const product = productInput(await body(req));
+        db.exec('BEGIN IMMEDIATE');
+        let saved;
+        try {
+          const result = statements.insert.run(product);
+          const id = Number(result.lastInsertRowid);
+          if (product.stock > 0) db.prepare('INSERT INTO stock_movements (productId,quantity,beforeStock,afterStock,reason) VALUES (?,?,?,?,?)').run(id,product.stock,0,product.stock,'Opening balance');
+          saved = statements.one.get(id);
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+        return send(res, 201, saved);
+      }
+      const edit = url.pathname.match(/^\/api\/admin\/products\/(\d+)$/);
+      if (edit && req.method === 'PATCH') {
+        const id = Number(edit[1]), product = productInput(await body(req));
+        db.exec('BEGIN IMMEDIATE');
+        let saved;
+        try {
+          const existing = statements.one.get(id);
+          if (!existing) { db.exec('ROLLBACK'); return send(res, 404, { error:'Product not found.' }); }
+          if (!product.img) product.img = existing.img;
+          if (product.stock < existing.reservedStock) { db.exec('ROLLBACK'); return send(res,409,{error:`Stock cannot be lower than the ${existing.reservedStock} units reserved for confirmed orders.`}); }
+          statements.update.run({ ...product, id });
+          if (product.stock !== existing.stock) db.prepare('INSERT INTO stock_movements (productId,quantity,beforeStock,afterStock,reason) VALUES (?,?,?,?,?)').run(id,product.stock-existing.stock,existing.stock,product.stock,'Catalog edit stock correction');
+          saved = statements.one.get(id);
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+        return send(res, 200, saved);
+      }
+      const adjust = url.pathname.match(/^\/api\/admin\/products\/(\d+)\/adjust$/);
+      if (adjust && req.method === 'POST') {
+        const id = Number(adjust[1]), data = await body(req), quantity = Number(data.quantity), reason = String(data.reason || '').trim();
+        const product = statements.one.get(id);
+        if (!product) return send(res, 404, { error:'Product not found.' });
+        if (!Number.isFinite(quantity) || quantity === 0 || Math.abs(quantity) > 1_000_000 || reason.length < 3 || reason.length > 200) return send(res, 400, { error:'Enter a non-zero quantity change and a reason (3–200 characters).' });
+        const after = product.stock + quantity;
+        if (after < product.reservedStock) return send(res, 409, { error:`This would put stock below the ${product.reservedStock} units reserved for confirmed orders.` });
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          db.prepare('UPDATE products SET stock=?,updatedAt=CURRENT_TIMESTAMP WHERE id=?').run(after,id);
+          db.prepare('INSERT INTO stock_movements (productId,quantity,beforeStock,afterStock,reason) VALUES (?,?,?,?,?)').run(id,quantity,product.stock,after,reason);
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+        return send(res, 200, statements.one.get(id));
+      }
+      return send(res, 404, { error:'API route not found.' });
+    }
+
+    const isUpload = url.pathname.startsWith('/uploads/');
+    let file;
+    if (isUpload) {
+      const match = url.pathname.match(/^\/uploads\/([a-f0-9]{32}\.(?:jpg|png|webp))$/);
+      if (!match) { res.writeHead(404); return res.end(); }
+      file = join(root,'uploads',match[1]);
+      try { await stat(file); } catch { res.writeHead(404); return res.end(); }
+    } else {
+      const path = normalize(decodeURIComponent(url.pathname)).replace(/^([.][.][/\\])+/, '').replace(/^[/\\]+/, '');
+      const publicAssets = new Set(['index.html','app.js','styles.css','admin.css','catalog.json']);
+      file = publicAssets.has(path) ? join(root, path) : join(root, 'index.html');
+    }
+    try { if ((await stat(file)).isDirectory()) file = join(file, 'index.html'); }
+    catch { file = join(root, 'index.html'); }
+    const data = await readFile(file);
+    res.writeHead(200, { 'Content-Type':mime[extname(file)] || 'application/octet-stream', 'Cache-Control':isUpload?'public, max-age=31536000, immutable':'no-store', 'X-Content-Type-Options':'nosniff', 'Referrer-Policy':'strict-origin-when-cross-origin' }); res.end(data);
+  } catch (error) {
+    const duplicate = String(error.message).includes('UNIQUE constraint failed');
+    send(res, duplicate ? 409 : 400, { error:duplicate ? 'That SKU is already in use.' : error.message || 'The request could not be completed.' });
+  }
+});
+
+const port=Number(process.env.PORT||4173);
+if(!Number.isInteger(port)||port<1||port>65535)throw new Error('PORT must be a whole number between 1 and 65535.');
+const host=String(process.env.HOST||(process.env.NODE_ENV==='production'?'0.0.0.0':'127.0.0.1'));
+server.on('error',error=>{
+  const message=error.code==='EADDRINUSE'?`Port ${port} is already in use. Stop the other server or choose another PORT.`:`The server could not start (${error.code||'unknown error'}).`;
+  console.error(message);
+  process.exitCode=1;
+});
+server.listen(port,host,()=>console.log(`Fastrack Fabrics listening on ${host==='0.0.0.0'?'0.0.0.0':host}:${port}`));

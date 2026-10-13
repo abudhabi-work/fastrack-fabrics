@@ -1,0 +1,8 @@
+fastrack.sqlite
+fastrack.sqlite-shm
+fastrack.sqlite-wal
+node_modules/
+.env
+.env.*
+!.env.example
+uploads/
